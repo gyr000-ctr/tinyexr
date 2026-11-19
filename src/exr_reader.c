@@ -1634,6 +1634,325 @@ fail:
 }
 
 /* ============================================================================
+ * Rectangular region decode
+ *
+ * The rect is resolved to the chunk range that can cover it (scanline blocks
+ * or one level's tile grid). Each intersecting chunk is decoded in turn into a
+ * single reusable scratch block and only the intersecting bytes are copied, so
+ * peak memory is the region planes plus one decoded block. The copy is done in
+ * chunk-relative sample units, which keeps it exactly aligned with the
+ * whole-part scatter for subsampled channels too.
+ * ========================================================================== */
+
+size_t exr_region_channel_size(const exr_header *h, int32_t channel) {
+    int nx, ny;
+    if (!h || !h->channels || channel < 0 || channel >= h->num_channels)
+        return 0;
+    nx = nsamp(h->data_window.min_x, h->data_window.max_x,
+               h->channels[channel].x_sampling);
+    ny = nsamp(h->data_window.min_y, h->data_window.max_y,
+               h->channels[channel].y_sampling);
+    if (nx <= 0 || ny <= 0) return 0;
+    return (size_t)nx * (size_t)ny;
+}
+
+/* Copy the parts of one decoded chunk block that intersect the rect. The
+ * canonical block is per row then per channel, sample data of
+ * nsamp(chunk_x0, chunk_x1, xs) samples; rows where yy % ys != 0 are skipped.
+ * Sample columns are multiples of the sampling rate in absolute x, so the
+ * chunk-local column and rect row/column indices are derived the same way the
+ * whole-part scatter and the codec do. dst channels are planar, each row of
+ * the rect is nsamp(rx0, rx1, xs) samples. */
+exr_result exr_region_scatter(const exr_header *h, void **dst, int rx0, int ry0,
+                              int rx1, int ry1, int abs_x0, int abs_y0, int cw,
+                              int ch, const uint8_t *block,
+                              size_t block_size) {
+    size_t off = 0;
+    int row, c;
+    for (row = 0; row < ch; ++row) {
+        int64_t yy = (int64_t)abs_y0 + row;
+        int64_t chunk_x1 = (int64_t)abs_x0 + cw - 1;
+        for (c = 0; c < h->num_channels; ++c) {
+            const exr_channel *chd = &h->channels[c];
+            int xs = chd->x_sampling, ys = chd->y_sampling;
+            size_t ps = exr_pixel_size(chd->pixel_type);
+            int64_t a, b;
+            int nx, drow, scol, dcol, n, dw, dh;
+            size_t bytes;
+            if (xs < 1) xs = 1;
+            if (ys < 1) ys = 1;
+            if ((yy % ys) != 0) continue;
+            nx = nsamp(abs_x0, chunk_x1, xs);
+            if (nx <= 0) continue;
+            bytes = (size_t)nx * ps;
+            if (off > block_size || bytes > block_size - off)
+                return EXR_ERROR_CORRUPT;
+            a = rx0 > abs_x0 ? rx0 : abs_x0;
+            b = rx1 < chunk_x1 ? rx1 : chunk_x1;
+            if (a <= b && yy >= ry0 && yy <= ry1) {
+                scol = nsamp(abs_x0, a - 1, xs); /* first sample >= a */
+                n = nsamp(abs_x0, b, xs) - scol;
+                dcol = nsamp(rx0, a - 1, xs);    /* its rect column */
+                dw = nsamp(rx0, rx1, xs);
+                dh = nsamp(ry0, ry1, ys);
+                drow = nsamp(ry0, yy, ys) - 1;
+                if (n > 0) {
+                    if (scol < 0 || scol + n > nx || dcol < 0 || dcol + n > dw ||
+                        drow < 0 || drow >= dh)
+                        return EXR_ERROR_CORRUPT;
+                    memcpy((uint8_t *)dst[c] +
+                               ((size_t)drow * (size_t)dw + (size_t)dcol) * ps,
+                           block + off + (size_t)scol * ps, (size_t)n * ps);
+                }
+            }
+            off += bytes;
+        }
+    }
+    return EXR_SUCCESS;
+}
+
+/* Scanline chunk index range that covers [y0,y1] for any line order. */
+static void region_scanline_range(const exr_int_part *p, int y0, int y1,
+                                  uint32_t *first, uint32_t *last) {
+    int lpb = exr_lines_per_block(p->header.compression);
+    int64_t ymin = p->header.data_window.min_y;
+    *first = (uint32_t)(((int64_t)y0 - ymin) / lpb);
+    *last = (uint32_t)(((int64_t)y1 - ymin) / lpb);
+}
+
+exr_result exr_reader_read_region(exr_reader *r, int32_t part, int32_t x0,
+                                  int32_t y0, int32_t width, int32_t height,
+                                  int32_t level_x, int32_t level_y,
+                                  exr_part *out) {
+    exr_int_part *p;
+    const exr_header *h;
+    const exr_allocator *a;
+    int rx1, ry1, lw, lh, nxt, nyt;
+    int tx = 0, ty = 0;
+    exr_result rc;
+    uint8_t *block = NULL;
+    size_t block_cap = 0;
+
+    if (!r || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_parse_header(r);
+    if (rc != EXR_SUCCESS) return rc;
+    if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    p = &r->parts[part];
+    h = &p->header;
+    a = &r->alloc;
+    if (r->kind == EXR_SRC_CALLBACK) {
+        /* The callback path drives a resumable, bounded source operation that
+         * decodes only the chunks intersecting the rect; streaming callers see
+         * the same pixels as the memory path with the same memory bound. Only
+         * level (0,0) is materialized by that operation. */
+        if (level_x != 0 || level_y != 0) return EXR_ERROR_UNSUPPORTED;
+        return exr_source_read_part(r, part, 3, x0, y0, width, height, out);
+    }
+
+    if (h->part_type != EXR_PART_SCANLINE && h->part_type != EXR_PART_TILED)
+        return EXR_ERROR_UNSUPPORTED;
+    if (width <= 0 || height <= 0 ||
+        !exr_valid_span(x0, width) || !exr_valid_span(y0, height))
+        return EXR_ERROR_INVALID_ARGUMENT;
+    rx1 = x0 + width - 1;
+    ry1 = y0 + height - 1;
+
+    if (h->part_type == EXR_PART_TILED) {
+        if (level_x < 0 || level_x >= p->num_x_levels || level_y < 0 ||
+            level_y >= p->num_y_levels ||
+            (h->level_mode == EXR_TILE_MIPMAP_LEVELS && level_x != level_y))
+            return EXR_ERROR_INVALID_ARGUMENT;
+        rc = tiled_level_size(p, level_x, level_y, &lw, &lh, &nxt, &nyt);
+        if (rc != EXR_SUCCESS) return rc;
+        /* A level's pixels are addressed as absolute coordinates offset by the
+         * data-window origin, exactly like exr_reader_read_tile(). */
+        if ((int64_t)x0 < h->data_window.min_x ||
+            (int64_t)y0 < h->data_window.min_y ||
+            (int64_t)x0 + width - 1 >= (int64_t)h->data_window.min_x + lw ||
+            (int64_t)y0 + height - 1 >= (int64_t)h->data_window.min_y + lh)
+            return EXR_ERROR_INVALID_ARGUMENT;
+        tx = (int)h->tile_x_size;
+        ty = (int)h->tile_y_size;
+    } else {
+        if (level_x != 0 || level_y != 0) return EXR_ERROR_INVALID_ARGUMENT;
+        if (x0 < h->data_window.min_x || y0 < h->data_window.min_y ||
+            rx1 > h->data_window.max_x || ry1 > h->data_window.max_y)
+            return EXR_ERROR_INVALID_ARGUMENT;
+        lw = p->width;
+        lh = p->height;
+    }
+
+    rc = check_flat_output_limit(r, h, x0, y0, width, height);
+    if (rc != EXR_SUCCESS) return rc;
+
+    memset(out, 0, sizeof(*out));
+    rc = exr_header_copy(a, &out->header, h);
+    if (rc != EXR_SUCCESS) return rc;
+    out->width = width;
+    out->height = height;
+    out->header.data_window.min_x = x0;
+    out->header.data_window.min_y = y0;
+    out->header.data_window.max_x = rx1;
+    out->header.data_window.max_y = ry1;
+    rc = exr_flat_planes_alloc(a, h, x0, y0, width, height, out);
+    if (rc != EXR_SUCCESS) goto fail;
+
+    if (h->part_type == EXR_PART_TILED) {
+        int txi0 = (x0 - h->data_window.min_x) / tx;
+        int txi1 = (rx1 - h->data_window.min_x) / tx;
+        int tyi0 = (y0 - h->data_window.min_y) / ty;
+        int tyi1 = (ry1 - h->data_window.min_y) / ty;
+        int tyi, txi;
+        for (tyi = tyi0; tyi <= tyi1; ++tyi) {
+            for (txi = txi0; txi <= txi1; ++txi) {
+                uint32_t idx;
+                uint64_t off;
+                const uint8_t *hdr, *cdata;
+                size_t hdr_size = r->is_multipart ? 24 : 20;
+                int32_t htx, hty, hlx, hly, dsize;
+                int x0l, y0l, cw, chh, abs_x0, abs_y0;
+                size_t dst_size, want;
+                exr_codec_ctx ctx;
+
+                rc = exr_reader_tile_index(p, txi, tyi, level_x, level_y, &idx);
+                if (rc != EXR_SUCCESS) goto done;
+                off = p->offsets[idx];
+                rc = exr_reader_fetch(r, off, hdr_size, NULL, &hdr);
+                if (rc != EXR_SUCCESS) goto done;
+                if (r->is_multipart) {
+                    if (exr_rd_i32(hdr) != part) { rc = EXR_ERROR_CORRUPT; goto done; }
+                    hdr += 4;
+                }
+                htx = exr_rd_i32(hdr);
+                hty = exr_rd_i32(hdr + 4);
+                hlx = exr_rd_i32(hdr + 8);
+                hly = exr_rd_i32(hdr + 12);
+                dsize = exr_rd_i32(hdr + 16);
+                if (hlx != level_x || hly != level_y || htx != txi ||
+                    hty != tyi || dsize < 0) {
+                    rc = EXR_ERROR_CORRUPT; goto done;
+                }
+                x0l = txi * tx;
+                y0l = tyi * ty;
+                cw = (tx < lw - x0l) ? tx : (lw - x0l);
+                chh = (ty < lh - y0l) ? ty : (lh - y0l);
+                if (cw <= 0 || chh <= 0) { rc = EXR_ERROR_CORRUPT; goto done; }
+                abs_x0 = h->data_window.min_x + x0l;
+                abs_y0 = h->data_window.min_y + y0l;
+                rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                                 abs_x0, abs_y0, cw, chh,
+                                                 &dst_size);
+                if (rc != EXR_SUCCESS) goto done;
+                if (exr_add_ovf((size_t)off, hdr_size, &want)) {
+                    rc = EXR_ERROR_CORRUPT; goto done;
+                }
+                rc = exr_reader_fetch(r, want, (size_t)dsize, NULL, &cdata);
+                if (rc != EXR_SUCCESS) goto done;
+                if (!block || dst_size > block_cap) {
+                    exr_free(a, block);
+                    block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
+                    if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+                    block_cap = dst_size;
+                }
+                ctx.alloc = a;
+                ctx.context = r->context;
+                ctx.compression = h->compression;
+                ctx.channels = h->channels;
+                ctx.num_channels = h->num_channels;
+                ctx.x = abs_x0;
+                ctx.y = abs_y0;
+                ctx.width = cw;
+                ctx.num_lines = chh;
+                rc = exr_decompress_block(&ctx, cdata, (size_t)dsize, block,
+                                          dst_size);
+                if (rc != EXR_SUCCESS) goto done;
+                rc = exr_region_scatter(h, out->images, x0, y0, rx1, ry1,
+                                        abs_x0, abs_y0, cw, chh, block,
+                                        dst_size);
+                if (rc != EXR_SUCCESS) goto done;
+            }
+        }
+    } else {
+        int lpb = exr_lines_per_block(h->compression);
+        int ymin = h->data_window.min_y;
+        uint32_t first, last, ci;
+        region_scanline_range(p, y0, ry1, &first, &last);
+        for (ci = first; ci <= last; ++ci) {
+            uint64_t off;
+            const uint8_t *hdr, *cdata;
+            size_t hdr_size = r->is_multipart ? 12 : 8;
+            int32_t hy0, data_size, nlines;
+            size_t dst_size, want;
+            exr_codec_ctx ctx;
+            int64_t expect_y0 = (int64_t)ymin + (int64_t)ci * lpb;
+
+            if (ci >= p->num_chunks) { rc = EXR_ERROR_CORRUPT; goto done; }
+            off = p->offsets[ci];
+            rc = exr_reader_fetch(r, off, hdr_size, NULL, &hdr);
+            if (rc != EXR_SUCCESS) goto done;
+            if (r->is_multipart) {
+                if (exr_rd_i32(hdr) != part) { rc = EXR_ERROR_CORRUPT; goto done; }
+                hdr += 4;
+            }
+            hy0 = exr_rd_i32(hdr);
+            data_size = exr_rd_i32(hdr + 4);
+            if (data_size < 0 || hy0 < h->data_window.min_y ||
+                hy0 > h->data_window.max_y || (int64_t)hy0 != expect_y0) {
+                rc = EXR_ERROR_CORRUPT; goto done;
+            }
+            nlines = lpb;
+            if (nlines > h->data_window.max_y - hy0 + 1)
+                nlines = h->data_window.max_y - hy0 + 1;
+            rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                             h->data_window.min_x, hy0, lw,
+                                             nlines, &dst_size);
+            if (rc != EXR_SUCCESS) goto done;
+            if (exr_add_ovf((size_t)off, hdr_size, &want)) {
+                rc = EXR_ERROR_CORRUPT; goto done;
+            }
+            rc = exr_reader_fetch(r, want, (size_t)data_size, NULL, &cdata);
+            if (rc != EXR_SUCCESS) goto done;
+            if (!block || dst_size > block_cap) {
+                exr_free(a, block);
+                block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
+                if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+                block_cap = dst_size;
+            }
+            ctx.alloc = a;
+            ctx.context = r->context;
+            ctx.compression = h->compression;
+            ctx.channels = h->channels;
+            ctx.num_channels = h->num_channels;
+            ctx.x = h->data_window.min_x;
+            ctx.y = hy0;
+            ctx.width = lw;
+            ctx.num_lines = nlines;
+            rc = exr_decompress_block(&ctx, cdata, (size_t)data_size, block,
+                                      dst_size);
+            if (rc != EXR_SUCCESS) goto done;
+            rc = exr_region_scatter(h, out->images, x0, y0, rx1, ry1,
+                                    h->data_window.min_x, hy0, lw, nlines,
+                                    block, dst_size);
+            if (rc != EXR_SUCCESS) goto done;
+        }
+    }
+
+    exr_free(a, block);
+    return EXR_SUCCESS;
+
+done:
+    exr_free(a, block);
+    if (rc == EXR_SUCCESS) rc = EXR_ERROR_CORRUPT;
+    exr_part_free(a, out); /* on error (and WOULD_BLOCK), out owns nothing */
+    return rc;
+
+fail:
+    exr_free(a, block);
+    exr_part_free(a, out);
+    return rc;
+}
+
+/* ============================================================================
  * Streaming block I/O (bounded working memory)
  * ========================================================================== */
 

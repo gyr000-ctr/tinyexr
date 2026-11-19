@@ -20,6 +20,11 @@ untouched.
 - `make lib`        — build `build/libtinyexr3.a` (`-std=c11 -Wall -Wextra -Werror`).
 - `make c11-gate`   — strict pure-C11 syntax gate over all `src/*.c` (must stay green).
 - `make test-c`     — unit tests under ASan+UBSan (note: runs with `detect_leaks=0`).
+- `make test-exr-region` — self-contained rectangular-region decode test
+  (`test/unit/test_exr_region.c`) under ASan+UBSan+LSan: every region is checked
+  bit-identical to the whole-part decode across scanline/tiled/mipmap/ripmap
+  parts, every level, subsampling, the streaming source, damaged chunks and a
+  peak-memory bound. Needs no external corpus.
 - `make fuzz-corpus`— replay `test/unit/regression/*` under ASan+UBSan+**LSan**
   (this is what catches error-path leaks; keep it green).
 - `make fuzz-corpus-asan` — same corpus replay with `ASAN_OPTIONS=detect_leaks=0`;
@@ -68,6 +73,14 @@ Keep first-party code out of the allowlist.
   attribution (fpng = public domain, fpnge = Apache-2.0; see `NOTICE`).
 - All hostile-input arithmetic goes through `exr_mul_ovf` / `exr_add_ovf`.
   Error paths must leave outputs owning nothing (`exr_part_free` on failure).
+- Region decode (`exr_reader_read_region`, `src/exr_reader.c`) is block-driven:
+  it selects only intersecting chunks, decodes each into one reusable scratch
+  block, and copies only intersecting samples via `exr_region_scatter` — the
+  same sample-grid math as the whole-part scatter, so results stay bit
+  identical. Deep parts return UNSUPPORTED; a bad rect is INVALID_ARGUMENT and a
+  damaged chunk is CORRUPT. Streaming sources reuse the bounded source operation
+  (kind 3 in `exr_source_part.c`), which skips chunks outside the rect and all
+  non-zero levels; keep that filter in sync with the memory path.
 - SIMD kernels use `__attribute__((target(...)))` + a runtime CPUID vtable so
   everything compiles at baseline; scalar fallback is always present and is the
   source of truth (SIMD must be bit-identical).

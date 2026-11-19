@@ -27,6 +27,7 @@ typedef struct source_operation {
     uint32_t next, end;
     size_t owned;
     uint64_t total, *prefix;
+    int32_t rx0, ry0, rw, rh; /* kind 3 (region): absolute rect */
     source_job jobs[SOURCE_BATCH_CAP];
     exr_reader *reader;
     exr_context *codec_context;
@@ -85,6 +86,15 @@ static exr_result source_init(exr_reader *r, int32_t part, int kind,
         crop.min_x = bi.x0; crop.min_y = bi.y0;
         crop.max_x = bi.x0 + (bi.width - 1); crop.max_y = bi.y0 + (bi.height - 1);
         first = k; end = k + 1;
+    } else if (kind == 3) {
+        /* Region: x/y is the rect origin, lx/ly the rect width/height. The
+         * rect replaces the crop; the chunk range is the whole table and
+         * source_prefetch skips chunks that miss the rect, so only
+         * intersecting chunks are read and decoded. */
+        if (lx <= 0 || ly <= 0) return EXR_ERROR_INVALID_ARGUMENT;
+        crop.min_x = x; crop.min_y = y;
+        crop.max_x = x + (lx - 1); crop.max_y = y + (ly - 1);
+        first = 0; end = p->num_chunks;
     }
     op = (source_operation *)exr_calloc(&r->alloc, 1, sizeof(*op));
     if (!op) return EXR_ERROR_OUT_OF_MEMORY;
@@ -92,6 +102,10 @@ static exr_result source_init(exr_reader *r, int32_t part, int kind,
     op->reader = r; op->part = part; op->kind = kind;
     op->x = x; op->y = y; op->lx = lx; op->ly = ly;
     op->next = first; op->end = end;
+    if (kind == 3) {
+        op->rx0 = crop.min_x; op->ry0 = crop.min_y;
+        op->rw = lx; op->rh = ly;
+    }
     op->width = crop.max_x - crop.min_x + 1;
     op->height = crop.max_y - crop.min_y + 1;
     op->batch_width = exr_get_num_threads();
@@ -197,7 +211,17 @@ static void source_job_run(void *user, int index) {
             if (!j->scratch) { j->rc = EXR_ERROR_OUT_OF_MEMORY; return; }
         }
         j->rc = exr_reader_decode_block(&shadow, op->part, j->index, j->scratch, j->bi.uncompressed_size);
-        if (j->rc == EXR_SUCCESS) j->rc = scatter_flat(op, j, j->scratch);
+        if (j->rc == EXR_SUCCESS) {
+            if (op->kind == 3) {
+                int rx1 = op->rx0 + op->rw - 1, ry1 = op->ry0 + op->rh - 1;
+                j->rc = exr_region_scatter(h, op->output.images, op->rx0, op->ry0,
+                                           rx1, ry1, j->bi.x0, j->bi.y0,
+                                           j->bi.width, j->bi.height, j->scratch,
+                                           j->bi.uncompressed_size);
+            } else {
+                j->rc = scatter_flat(op, j, j->scratch);
+            }
+        }
         return;
     }
     if (exr_mul_ovf((size_t)j->bi.width, (size_t)j->bi.height, &npix)) {
@@ -323,6 +347,18 @@ static exr_result source_prefetch(source_operation *op) {
         rc = exr_reader_block_info(op->reader, op->part, op->next, &j->bi);
         if (rc != EXR_SUCCESS) return rc;
         if (op->kind == 0 && (j->bi.level_x || j->bi.level_y)) { ++op->next; continue; }
+        if (op->kind == 3) {
+            /* Streaming regions address level 0; higher levels of a
+             * mipmap/ripmap overlap the rect in packed coordinates, so they
+             * must be skipped rather than scattered as level-0 pixels. */
+            if (j->bi.level_x || j->bi.level_y) { ++op->next; continue; }
+            if (j->bi.x0 + j->bi.width - 1 < op->rx0 ||
+                j->bi.x0 > op->rx0 + op->rw - 1 ||
+                j->bi.y0 + j->bi.height - 1 < op->ry0 ||
+                j->bi.y0 > op->ry0 + op->rh - 1) {
+                ++op->next; continue;
+            }
+        }
         j->index = op->next;
         rc = exr_source_chunk(op->reader, op->part, j->index, op->output.is_deep && op->pass == 0, &j->data, &j->size);
         if (rc == EXR_WOULD_BLOCK) return rc;

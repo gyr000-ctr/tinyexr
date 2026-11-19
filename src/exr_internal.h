@@ -736,6 +736,13 @@ struct exr_reader {
 /* Callback input retains metadata and active chunk ranges, never the file. */
 exr_result exr_source_chunk(exr_reader *r, int32_t part, uint32_t index,
                              int counts_only, uint8_t **data, size_t *size);
+
+/* Copy the parts of one decoded canonical flat block (chunk origin abs_x0/
+ * abs_y0, extent cw x ch) that intersect the absolute rect [rx0..rx1]x
+ * [ry0..ry1] into planar region planes dst (row stride nsamp(rx0,rx1,xs)). */
+exr_result exr_region_scatter(const exr_header *h, void **dst, int rx0, int ry0,
+                              int rx1, int ry1, int abs_x0, int abs_y0, int cw,
+                              int ch, const uint8_t *block, size_t block_size);
 exr_result exr_reader_tile_index(const exr_int_part *p, int tx, int ty,
                                   int lx, int ly, uint32_t *index);
 exr_result exr_reader_check_chunk(exr_reader *r, int32_t part, uint32_t index,

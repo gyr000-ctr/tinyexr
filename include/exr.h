@@ -446,6 +446,44 @@ exr_result exr_reader_read_tile(exr_reader *r, int32_t part, int32_t tile_x,
                                 int32_t tile_y, int32_t level_x, int32_t level_y,
                                 exr_part *out);
 
+/*
+ * Decode an arbitrary rectangle of a flat (scanline or tiled) part.
+ *
+ * (x0, y0, width, height) are absolute data-window coordinates; the rect must
+ * lie entirely inside the part's data window (else EXR_ERROR_INVALID_ARGUMENT).
+ * For tiled parts the rect addresses pixel coordinates of level
+ * (level_x, level_y) as they are stored in the file (level 0 is the data
+ * window; each level halves the coordinate space). Scanline parts require
+ * (level_x, level_y) == (0, 0). Only the chunks intersecting the rect are
+ * fetched and decoded, so peak memory is the output rect plus one decoded
+ * block, independent of the image size.
+ *
+ * On success `out` is a flat part whose header.data_window is the requested
+ * rect and whose planes hold exactly the pixels of that rect, sampled per
+ * channel: a channel is stored at its own data-window-sampled resolution, so a
+ * 2x2-subsampled channel over a 4x4 rect yields 2x2 samples. Pixel values are
+ * bit-identical to the same coordinates in exr_reader_read_part()'s output.
+ *
+ * out->width/height are the rect's pixel dimensions for convenience; read
+ * per-channel plane sizes with exr_region_channel_size(). Ownership transfers
+ * only on EXR_SUCCESS; on error (including EXR_WOULD_BLOCK when streaming) out
+ * owns nothing and the same request may be retried after exr_reader_supply().
+ * Deep parts return EXR_ERROR_UNSUPPORTED (use the deep block API). Streaming
+ * sources serve level (0, 0) only; other levels return EXR_ERROR_UNSUPPORTED.
+ * A corrupted/mismatched chunk is reported as EXR_ERROR_CORRUPT and an
+ * out-of-window rect as EXR_ERROR_INVALID_ARGUMENT, so callers can tell them
+ * apart. Region reads of streaming sources are single-threaded.
+ */
+exr_result exr_reader_read_region(exr_reader *r, int32_t part, int32_t x0,
+                                  int32_t y0, int32_t width, int32_t height,
+                                  int32_t level_x, int32_t level_y,
+                                  exr_part *out);
+
+/* Number of samples/channel elements in channel `channel`'s plane of a part
+ * whose data window is `rect` (i.e. of a region result or any crop). Returns 0
+ * for a NULL header or out-of-range channel. */
+size_t exr_region_channel_size(const exr_header *h, int32_t channel);
+
 /* ---- Streaming suspend / resume (only meaningful with a data source) ---- */
 typedef struct exr_pending_read {
     uint64_t offset;

@@ -23,7 +23,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate lean-check lean-diff lean-gen lean-gen-update lean-gen-check codec-diff texcomp-web texcomp-bc6h-diff texcomp-bc7-diff texcomp-bc135-diff texcomp-etc2-diff texcomp-astc-diff texcomp-astc-ldr-diff texcomp-astc-uastc-diff texcomp-astc-hdrenc-diff texcomp-astc-quant-diff texcomp-astc-hdrimg-diff texcomp-astc-ldrimg-diff texcomp-astc-ldrdec-diff texcomp-uni-diff texcomp-uni-transcode-diff texcomp-etc2-enc-diff tocio-diff tocio-yaml-diff tocio-config-diff tocio-proc-diff tocio-codegen-diff tocio-glsl-diff fuzz fuzz-threads tocio-fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare bench-htj2k arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd ptexatlas-c11-gate
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate test-exr-region lean-check lean-diff lean-gen lean-gen-update lean-gen-check codec-diff texcomp-web texcomp-bc6h-diff texcomp-bc7-diff texcomp-bc135-diff texcomp-etc2-diff texcomp-astc-diff texcomp-astc-ldr-diff texcomp-astc-uastc-diff texcomp-astc-hdrenc-diff texcomp-astc-quant-diff texcomp-astc-hdrimg-diff texcomp-astc-ldrimg-diff texcomp-astc-ldrdec-diff texcomp-uni-diff texcomp-uni-transcode-diff texcomp-etc2-enc-diff tocio-diff tocio-yaml-diff tocio-config-diff tocio-proc-diff tocio-codegen-diff tocio-glsl-diff fuzz fuzz-threads tocio-fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare bench-htj2k arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd ptexatlas-c11-gate
 
 all: $(TARGET)
 
@@ -1523,6 +1523,19 @@ $(PARSE_HARNESS): test/v3/parse_harness.c build/libtinyexr3.a | build
 
 parse-test: lib $(PARSE_HARNESS)
 	python3 test/v3/parse-tester.py --harness $(PARSE_HARNESS) $(EXR_IMAGES)
+
+# ---- rectangular region decode (arbitrary rect from any flat part) --------
+# Self-contained: builds its own fixtures in memory, no corpus needed. Compares
+# every region against the whole-part decode across scanline/tiled/mipmap/
+# ripmap parts, every level, the streaming source, damaged chunks and peak
+# memory, under ASan+UBSan (LSan stays on: the test is leak-clean).
+.PHONY: test-exr-region
+test-exr-region: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) \
+                 test/unit/test_exr_region.c | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) \
+	  test/unit/test_exr_region.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o \
+	  $(LD_TEST_OBJ) $(THREAD_LIBS) -lm -o build/test_exr_region
+	ASAN_OPTIONS="$${ASAN_OPTIONS:-detect_leaks=1}" ./build/test_exr_region
 
 # ---- native example (uses the optional stdio layer) -----------------------
 examples-c: lib

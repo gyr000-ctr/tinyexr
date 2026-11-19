@@ -221,6 +221,25 @@ static void drain_reader(exr_reader *r, const exr_allocator *a,
                     if (rc == EXR_SUCCESS) exr_part_free(a, &out);
                 }
             }
+            if (h && (h->part_type == EXR_PART_SCANLINE ||
+                      h->part_type == EXR_PART_TILED)) {
+                /* A hostile rect of small area: in-bounds, off-edge, and
+                 * degenerate sizes all exercise the region clip/scatter. */
+                static const int edge[4][2] = {{0, 0}, {1, 1}, {-1, -1}, {2, 3}};
+                int64_t w = h->data_window.max_x - h->data_window.min_x + 1;
+                int64_t ht = h->data_window.max_y - h->data_window.min_y + 1;
+                int k;
+                for (k = 0; k < 4; ++k) {
+                    int32_t rx0 = h->data_window.min_x + edge[k][0];
+                    int32_t ry0 = h->data_window.min_y + edge[k][1];
+                    int32_t rw = (int32_t)((w > 16 ? 16 : w) + k);
+                    int32_t rh = (int32_t)((ht > 16 ? 16 : ht) + k);
+                    memset(&out, 0, sizeof(out));
+                    RETRY_READ(exr_reader_read_region(r, p, rx0, ry0, rw, rh,
+                                                      0, 0, &out));
+                    if (rc == EXR_SUCCESS) exr_part_free(a, &out);
+                }
+            }
         }
         drain_blocks(r, p, file, file_size);
     }
