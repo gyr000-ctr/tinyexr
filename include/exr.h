@@ -46,6 +46,7 @@ typedef enum exr_result {
     EXR_ERROR_IO = -5,              /* file open/read/write failure */
     EXR_ERROR_CORRUPT = -6,         /* bounds/overflow/decode failure */
     EXR_ERROR_LIMIT_EXCEEDED = -7,  /* configured resource limit exceeded */
+    EXR_ERROR_UNSUPPORTED_CHANNEL = -8 /* channel layout a helper cannot express */
 } exr_result;
 
 #define EXR_OK(r) ((int)(r) >= 0)
@@ -973,7 +974,20 @@ exr_result exr_lut3d_parse_cube(const exr_allocator *a, const char *text,
  * *out must be freed with the same allocator.
  * Sample grids use absolute data-window coordinates. Returns UNSUPPORTED if
  * any required plane has no samples in the returned region; no samples are
- * fetched outside a partial part. On failure *out is NULL. */
+ * fetched outside a partial part. On failure *out is NULL.
+ *
+ * Deep parts (is_deep != 0) are composited instead of gathered: each pixel's
+ * samples are combined front-to-back with the "over" operator (OpenEXR deep
+ * samples carry premultiplied RGB) and written as 4-channel premultiplied RGBA,
+ * with *out_channels == 4. Samples are ordered by Z when the part has a usable
+ * Z channel and kept in file order otherwise. Memory is O(width*height) plus
+ * one pixel's worst-case sample scratch, independent of the total sample count.
+ * Requires R, G, B and A channels of full resolution; when one is missing or
+ * cannot be widened to float the result is EXR_ERROR_UNSUPPORTED_CHANNEL.
+ * Inconsistent part storage (negative counts, a nonzero `deep_total_samples`
+ * that does not match the count sum, a non-positive size, or a required sample
+ * plane that is absent while samples are promised) returns
+ * EXR_ERROR_INVALID_ARGUMENT. */
 exr_result exr_part_to_rgba_float(const exr_allocator *a, const exr_part *part,
                                   float **out, int *out_width, int *out_height,
                                   int *out_channels);

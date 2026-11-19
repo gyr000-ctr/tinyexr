@@ -204,6 +204,228 @@ static int sampled_index(int origin, int pos, int step, int count) {
     return i < 0 ? 0 : i >= count ? count - 1 : (int)i;
 }
 
+/* ============================================================================
+ * Deep -> RGBA ("over") compositing
+ *
+ * Deep samples are stored per pixel, in pixel order, with the samples for a
+ * pixel packed together. A deep sample's RGB is premultiplied by its alpha
+ * (the OpenEXR deep convention), so a front-to-back "over" composite is
+ *
+ *     T = 1 - A;  R += T*Sr;  A += T*Sa;   (and likewise G, B)
+ *
+ * which is exactly OpenEXR's ImfDeepCompositing. Samples are ordered by the Z
+ * channel when the part has one (ties keep file order); when it has no Z they
+ * are composited in file order. The result is premultiplied RGBA.
+ *
+ * Memory is O(width*height) for the result plus O(max samples per pixel) for
+ * the per-pixel Z/order scratch, independent of the total sample count.
+ * ========================================================================== */
+
+typedef struct deep_rgba_channels {
+    int r, g, b, a, z; /* channel indices; z == -1 when the part has no Z */
+} deep_rgba_channels;
+
+/* A deep channel is usable here only if it is full-resolution and has a scalar
+ * pixel type this module can widen to float. */
+static int deep_channel_usable(const exr_channel *ch) {
+    int t = (int)ch->pixel_type;
+    return ch->x_sampling == 1 && ch->y_sampling == 1 &&
+           t >= (int)EXR_PIXEL_UINT && t <= (int)EXR_PIXEL_FLOAT;
+}
+
+/* Locate the channels a preview composite needs. RGB and A are required; a Z
+ * channel is used for front-to-back ordering when present. The caller treats
+ * a missing/unusable required channel as EXR_ERROR_UNSUPPORTED_CHANNEL. */
+static exr_result deep_resolve_channels(const exr_part *part,
+                                        deep_rgba_channels *out) {
+    const exr_channel *chs = part->header.channels;
+    int c;
+    out->r = out->g = out->b = out->a = out->z = -1;
+    for (c = 0; c < part->header.num_channels; ++c) {
+        const char *n = chs[c].name;
+        if (strcmp(n, "R") == 0)
+            out->r = c;
+        else if (strcmp(n, "G") == 0)
+            out->g = c;
+        else if (strcmp(n, "B") == 0)
+            out->b = c;
+        else if (strcmp(n, "A") == 0)
+            out->a = c;
+        else if (strcmp(n, "Z") == 0)
+            out->z = c;
+    }
+    if (out->r < 0 || out->g < 0 || out->b < 0 || out->a < 0)
+        return EXR_ERROR_UNSUPPORTED_CHANNEL;
+    if (!deep_channel_usable(&chs[out->r]) ||
+        !deep_channel_usable(&chs[out->g]) ||
+        !deep_channel_usable(&chs[out->b]) ||
+        !deep_channel_usable(&chs[out->a]))
+        return EXR_ERROR_UNSUPPORTED_CHANNEL;
+    /* A Z we cannot read only costs us sorting; it is never fatal. */
+    if (out->z >= 0 && !deep_channel_usable(&chs[out->z])) out->z = -1;
+    return EXR_SUCCESS;
+}
+
+/* Ascending (Z, original index) is a max-heap order over this predicate. The
+ * index tie-break keeps equal-depth samples in file order, i.e. the sort is
+ * stable without needing a second scratch array. */
+static int deep_greater(const float *z, int32_t ia, int32_t ib) {
+    if (z[ia] > z[ib]) return 1;
+    if (z[ia] < z[ib]) return 0;
+    return ia > ib;
+}
+
+static void deep_heap_sift(int32_t *order, int n, int root, const float *z) {
+    for (;;) {
+        int l = 2 * root + 1, largest = root;
+        if (l < n && deep_greater(z, order[l], order[largest])) largest = l;
+        if (l + 1 < n && deep_greater(z, order[l + 1], order[largest]))
+            largest = l + 1;
+        if (largest == root) return;
+        {
+            int32_t t = order[root];
+            order[root] = order[largest];
+            order[largest] = t;
+        }
+        root = largest;
+    }
+}
+
+static void deep_sort_by_z(int32_t *order, int n, const float *z) {
+    int i;
+    for (i = 0; i < n; ++i) order[i] = i;
+    for (i = n / 2 - 1; i >= 0; --i) deep_heap_sift(order, n, i, z);
+    for (i = n - 1; i > 0; --i) {
+        int32_t t = order[0];
+        order[0] = order[i];
+        order[i] = t;
+        deep_heap_sift(order, i, 0, z);
+    }
+}
+
+/* Composite one pixel's `cnt` samples, which start at global sample `base`.
+ * `order` is NULL when no Z ordering is available. */
+static void deep_composite_pixel(const exr_part *part,
+                                 const deep_rgba_channels *ch, size_t base,
+                                 int32_t cnt, const int32_t *order,
+                                 float dst[4]) {
+    const void *pr = part->deep_images[ch->r];
+    const void *pg = part->deep_images[ch->g];
+    const void *pb = part->deep_images[ch->b];
+    const void *pa = part->deep_images[ch->a];
+    exr_pixel_type tr = part->header.channels[ch->r].pixel_type;
+    exr_pixel_type tg = part->header.channels[ch->g].pixel_type;
+    exr_pixel_type tb = part->header.channels[ch->b].pixel_type;
+    exr_pixel_type ta = part->header.channels[ch->a].pixel_type;
+    float R = 0.0f, G = 0.0f, B = 0.0f, A = 0.0f;
+    int32_t s;
+    for (s = 0; s < cnt; ++s) {
+        size_t idx = base + (size_t)(order ? order[s] : s);
+        float T;
+        if (A >= 1.0f) break; /* fully opaque: nothing behind it contributes */
+        T = 1.0f - A;
+        R += T * load_sample(pr, tr, idx);
+        G += T * load_sample(pg, tg, idx);
+        B += T * load_sample(pb, tb, idx);
+        A += T * load_sample(pa, ta, idx);
+    }
+    dst[0] = R;
+    dst[1] = G;
+    dst[2] = B;
+    dst[3] = A;
+}
+
+static exr_result deep_part_to_rgba_float(const exr_allocator *a,
+                                          const exr_part *part, float **out,
+                                          int *out_width, int *out_height,
+                                          int *out_channels) {
+    int w = part->width, h = part->height;
+    size_t npix, bytes, i, off = 0, total = 0;
+    int32_t maxcnt = 0;
+    float *buf = NULL, *zbuf = NULL;
+    int32_t *order = NULL;
+    deep_rgba_channels ch;
+    exr_result rc;
+
+    if (!part->header.channels || !part->deep_sample_counts ||
+        !part->deep_images)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (w <= 0 || h <= 0 || part->header.num_channels <= 0)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    rc = deep_resolve_channels(part, &ch);
+    if (rc != EXR_SUCCESS) return rc;
+
+    /* Shape and sample-count validation: any inconsistency in the part itself
+     * is an argument error, not an unsupported channel layout. */
+    if (exr_mul_ovf((size_t)w, (size_t)h, &npix) ||
+        exr_mul_ovf(npix, 4u * sizeof(float), &bytes))
+        return EXR_ERROR_INVALID_ARGUMENT;
+    for (i = 0; i < npix; ++i) {
+        int32_t cnt = part->deep_sample_counts[i];
+        if (cnt < 0 || exr_add_ovf(total, (size_t)cnt, &total))
+            return EXR_ERROR_INVALID_ARGUMENT;
+        if (cnt > maxcnt) maxcnt = cnt;
+    }
+    /* deep_total_samples is the documented sum of the counts. A caller-built
+     * part may leave it at 0 ("not filled in"); any other value that disagrees
+     * with the counts is contradictory metadata and is refused. The field is
+     * never used to index, so an unset one is harmless. */
+    if (part->deep_total_samples != 0 &&
+        part->deep_total_samples != (uint64_t)total)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (total > 0 &&
+        (!part->deep_images[ch.r] || !part->deep_images[ch.g] ||
+         !part->deep_images[ch.b] || !part->deep_images[ch.a]))
+        return EXR_ERROR_INVALID_ARGUMENT;
+
+    buf = (float *)exr_malloc(a, bytes);
+    if (!buf) return EXR_ERROR_OUT_OF_MEMORY;
+    if (ch.z >= 0 && maxcnt > 0) {
+        size_t zbytes, obytes;
+        if (exr_mul_ovf((size_t)maxcnt, sizeof(float), &zbytes) ||
+            exr_mul_ovf((size_t)maxcnt, sizeof(int32_t), &obytes)) {
+            exr_free(a, buf);
+            return EXR_ERROR_INVALID_ARGUMENT;
+        }
+        zbuf = (float *)exr_malloc(a, zbytes);
+        order = (int32_t *)exr_malloc(a, obytes);
+        if (!zbuf || !order) {
+            exr_free(a, zbuf);
+            exr_free(a, order);
+            exr_free(a, buf);
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+    }
+
+    for (i = 0; i < npix; ++i) {
+        int32_t cnt = part->deep_sample_counts[i];
+        const int32_t *ord = NULL;
+        if (cnt > 0 && ch.z >= 0) {
+            exr_pixel_type tz = part->header.channels[ch.z].pixel_type;
+            const void *pz = part->deep_images[ch.z];
+            int32_t s;
+            if (!pz) { /* Z promised but absent: fall back to file order */
+                ch.z = -1;
+            } else {
+                for (s = 0; s < cnt; ++s)
+                    zbuf[s] = load_sample(pz, tz, off + (size_t)s);
+                deep_sort_by_z(order, (int)cnt, zbuf);
+                ord = order;
+            }
+        }
+        deep_composite_pixel(part, &ch, off, cnt, ord, buf + i * 4);
+        off += (size_t)cnt;
+    }
+
+    exr_free(a, zbuf);
+    exr_free(a, order);
+    *out = buf;
+    if (out_width) *out_width = w;
+    if (out_height) *out_height = h;
+    if (out_channels) *out_channels = 4;
+    return EXR_SUCCESS;
+}
+
 exr_result exr_part_to_rgba_float(const exr_allocator *a, const exr_part *part,
                                   float **out, int *out_width, int *out_height,
                                   int *out_channels) {
@@ -212,7 +434,10 @@ exr_result exr_part_to_rgba_float(const exr_allocator *a, const exr_part *part,
     float *buf;
     if (out) *out = NULL;
     if (!a) a = exr_default_allocator();
-    if (!part || !out || part->is_deep || !part->images || !part->header.channels)
+    if (part && out && part->is_deep)
+        return deep_part_to_rgba_float(a, part, out, out_width, out_height,
+                                       out_channels);
+    if (!part || !out || !part->images || !part->header.channels)
         return EXR_ERROR_INVALID_ARGUMENT;
     w = part->width;
     h = part->height;
