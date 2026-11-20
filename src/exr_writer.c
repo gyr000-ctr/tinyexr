@@ -2561,3 +2561,390 @@ exr_result exr_writer_end_stream(exr_writer *w) {
     }
     return rc;
 }
+
+/* ============================================================================
+ * Header-only rewrite (metadata edit with byte-for-byte chunk passthrough)
+ *
+ * The writer's header serializer (write_header + obuf) is reused below, but no
+ * codec ever runs: every chunk is located through the reader's offset table,
+ * its header is validated, and its bytes are streamed straight to the sink.
+ * Peak memory is one fixed copy buffer plus the reader's retained metadata.
+ * ========================================================================== */
+
+#define REWRITE_COPY_BUFFER 65536u
+
+/* Scanline chunk count implied by a parsed header: the data-window height
+ * divided into the codec's lines-per-block (reader's part_chunk_count parity). */
+static exr_result rewrite_scanline_count(const exr_header *h, int32_t height,
+                                         uint32_t *out) {
+    int lpb = exr_lines_per_block(h->compression);
+    if (lpb <= 0) return EXR_ERROR_CORRUPT;
+    *out = (uint32_t)(((int64_t)height + lpb - 1) / lpb);
+    return EXR_SUCCESS;
+}
+
+/* Rewrite has no suspend/resume protocol of its own: a random-access source
+ * that cannot serve a request immediately (EXR_WOULD_BLOCK) cannot be retried
+ * mid-copy without leaving a half-written sink, so it is reported as a
+ * distinct, terminal unsupported-operation error. */
+static exr_result rewrite_fetch(exr_reader *r, uint64_t off, size_t len,
+                                const uint8_t **out) {
+    exr_result rc = exr_reader_fetch(r, off, len, NULL, out);
+    if (rc == EXR_WOULD_BLOCK) return EXR_ERROR_UNSUPPORTED;
+    return rc;
+}
+
+/* Total on-disk chunk size (chunk header + payload) for chunk `index`, read
+ * from the source without pulling the payload itself. Flat chunks carry one
+ * uint32 payload length; deep chunks carry packed-offset and packed-sample
+ * uint64 lengths. All arithmetic is checked against the known file size. */
+static exr_result rewrite_measure_chunk(exr_reader *r, int32_t part,
+                                        uint32_t index, size_t *out_size) {
+    const exr_int_part *p = &r->parts[part];
+    const exr_header *h = &p->header;
+    int deep = h->part_type == EXR_PART_DEEP_SCANLINE ||
+               h->part_type == EXR_PART_DEEP_TILED;
+    size_t hsz = deep ? (h->tiled ? 40u : 28u) : (h->tiled ? 20u : 8u);
+    uint64_t off, n, samples = 0;
+    const uint8_t *hdr;
+    exr_result rc;
+    if (r->is_multipart) hsz += 4;
+    if (index >= p->num_chunks) return EXR_ERROR_CORRUPT;
+    off = p->offsets[index];
+    rc = rewrite_fetch(r, off, hsz, &hdr);
+    if (rc != EXR_SUCCESS) return rc;
+    rc = exr_reader_check_chunk(r, part, index, hdr);
+    if (rc != EXR_SUCCESS) return rc;
+    if (r->is_multipart) hdr += 4;
+    if (deep) {
+        n = exr_rd_u64(hdr + (h->tiled ? 16 : 4));
+        samples = exr_rd_u64(hdr + (h->tiled ? 24 : 12));
+    } else {
+        int32_t sz = exr_rd_i32(hdr + (h->tiled ? 16 : 4));
+        if (sz < 0) return EXR_ERROR_CORRUPT;
+        n = (uint32_t)sz;
+    }
+    if (n > UINT64_MAX - hsz || samples > UINT64_MAX - n - hsz)
+        return EXR_ERROR_CORRUPT;
+    n += hsz + samples;
+    if (off > r->file_size || n > r->file_size - off)
+        return EXR_ERROR_CORRUPT;
+    if (n > SIZE_MAX) return EXR_ERROR_LIMIT_EXCEEDED;
+    *out_size = (size_t)n;
+    return EXR_SUCCESS;
+}
+
+/* Reject any header edit that would move, resize or re-count chunks. The
+ * compared fields are exactly those the reader's chunk geometry depends on. */
+static exr_result rewrite_check_layout(const exr_header *orig,
+                                       const exr_header *edit) {
+    int32_t i;
+    if (orig->part_type != edit->part_type ||
+        orig->compression != edit->compression ||
+        orig->line_order != edit->line_order ||
+        orig->tiled != edit->tiled ||
+        orig->num_channels != edit->num_channels ||
+        memcmp(&orig->data_window, &edit->data_window, sizeof(exr_box2i)) != 0)
+        return EXR_ERROR_LAYOUT_CHANGED;
+    if (orig->tiled &&
+        (orig->tile_x_size != edit->tile_x_size ||
+         orig->tile_y_size != edit->tile_y_size ||
+         orig->level_mode != edit->level_mode ||
+         orig->rounding_mode != edit->rounding_mode))
+        return EXR_ERROR_LAYOUT_CHANGED;
+    for (i = 0; i < orig->num_channels; ++i) {
+        const exr_channel *a = &orig->channels[i];
+        const exr_channel *b = &edit->channels[i];
+        if (a->pixel_type != b->pixel_type ||
+            a->x_sampling != b->x_sampling ||
+            a->y_sampling != b->y_sampling ||
+            strcmp(a->name, b->name) != 0)
+            return EXR_ERROR_LAYOUT_CHANGED;
+    }
+    return EXR_SUCCESS;
+}
+
+/* Tiled chunk count from the data-window geometry (reader parity). */
+static exr_result rewrite_tiled_count(const exr_header *h, int32_t width,
+                                      int32_t height, uint32_t *out) {
+    int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size;
+    int up = (h->rounding_mode == EXR_TILE_ROUND_UP);
+    uint64_t total = 0;
+    if (tx <= 0 || ty <= 0 || width <= 0 || height <= 0)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (h->level_mode == EXR_TILE_ONE_LEVEL) {
+        total = (uint64_t)exr_ceil_div_pos(width, tx) *
+                (uint64_t)exr_ceil_div_pos(height, ty);
+    } else if (h->level_mode == EXR_TILE_MIPMAP_LEVELS) {
+        int w = width, hh = height;
+        for (;;) {
+            total += (uint64_t)exr_ceil_div_pos(w, tx) *
+                     (uint64_t)exr_ceil_div_pos(hh, ty);
+            if (w <= 1 && hh <= 1) break;
+            w = up ? (w + 1) / 2 : w / 2; if (w < 1) w = 1;
+            hh = up ? (hh + 1) / 2 : hh / 2; if (hh < 1) hh = 1;
+        }
+    } else { /* RIPMAP: ly outer, lx inner, matching the reader's table order */
+        int nxl = 1, nyl = 1, w = width, hh = height, lx, ly;
+        while (w > 1) { nxl++; w = up ? (w + 1) / 2 : w / 2; if (w < 1) w = 1; }
+        while (hh > 1) { nyl++; hh = up ? (hh + 1) / 2 : hh / 2; if (hh < 1) hh = 1; }
+        for (ly = 0; ly < nyl; ++ly) {
+            int lw, lh, t;
+            lh = height;
+            for (t = 0; t < ly; ++t) { lh = up ? (lh + 1) / 2 : lh / 2; if (lh < 1) lh = 1; }
+            for (lx = 0; lx < nxl; ++lx) {
+                lw = width;
+                for (t = 0; t < lx; ++t) { lw = up ? (lw + 1) / 2 : lw / 2; if (lw < 1) lw = 1; }
+                total += (uint64_t)exr_ceil_div_pos(lw, tx) *
+                         (uint64_t)exr_ceil_div_pos(lh, ty);
+            }
+        }
+    }
+    if (total > UINT32_MAX) return EXR_ERROR_CORRUPT;
+    *out = (uint32_t)total;
+    return EXR_SUCCESS;
+}
+
+static exr_result rewrite_sink_write(const exr_data_sink *sink, const void *p,
+                                     size_t n, uint64_t *pos) {
+    exr_result rc;
+    if (n == 0) return EXR_SUCCESS;
+    if (*pos > UINT64_MAX - (uint64_t)n) return EXR_ERROR_LIMIT_EXCEEDED;
+    rc = sink->write(sink->user, p, n);
+    if (rc != EXR_SUCCESS) return rc == EXR_WOULD_BLOCK ? EXR_ERROR_IO : rc;
+    *pos += n;
+    return EXR_SUCCESS;
+}
+
+exr_result exr_rewrite_to_sink(exr_reader *r, const exr_header *const *headers,
+                               const exr_data_sink *sink) {
+    const exr_allocator *a;
+    uint8_t *copy_buf = NULL;
+    uint64_t *off_pos = NULL;
+    uint64_t **new_offsets = NULL;
+    uint32_t *chunk_counts = NULL;
+    int **orders = NULL;
+    uint64_t out_pos = 0, metadata_total;
+    int any_tiled = 0, any_deep = 0, any_long = 0;
+    int32_t p;
+    exr_result rc = EXR_SUCCESS;
+    int sink_taken = 0;
+
+    if (!r || !sink || !sink->write || !sink->seek)
+        return EXR_ERROR_NOT_SEEKABLE;
+    rc = exr_reader_parse_header(r);
+    if (rc == EXR_WOULD_BLOCK) return EXR_ERROR_UNSUPPORTED;
+    if (rc != EXR_SUCCESS) return rc;
+    a = &r->alloc;
+
+    /* ---- validate edits + preflight chunk counts ------------------------- */
+    chunk_counts = (uint32_t *)exr_calloc(a, (size_t)r->num_parts,
+                                          sizeof(uint32_t));
+    new_offsets = (uint64_t **)exr_calloc(a, (size_t)r->num_parts,
+                                          sizeof(uint64_t *));
+    off_pos = (uint64_t *)exr_calloc(a, (size_t)r->num_parts,
+                                     sizeof(uint64_t));
+    orders = (int **)exr_calloc(a, (size_t)r->num_parts, sizeof(int *));
+    if (!chunk_counts || !new_offsets || !off_pos || !orders) {
+        rc = EXR_ERROR_OUT_OF_MEMORY; goto fail;
+    }
+    metadata_total = 8;
+    for (p = 0; p < r->num_parts; ++p) {
+        const exr_int_part *ip = &r->parts[p];
+        const exr_header *edit = headers ? headers[p] : &ip->header;
+        uint32_t want;
+        int32_t vw, vh, needs_long = 0;
+        int *order;
+        if (headers && !edit) { rc = EXR_ERROR_INVALID_ARGUMENT; goto fail; }
+        if (!EXR_OK(exr_header_validate(edit, 0, &vw, &vh, &needs_long))) {
+            rc = EXR_ERROR_INVALID_ARGUMENT; goto fail;
+        }
+        rc = rewrite_check_layout(&ip->header, edit);
+        if (rc != EXR_SUCCESS) goto fail;
+        if (needs_long) any_long = 1;
+        if (edit->tiled) any_tiled = 1;
+        if (edit->part_type == EXR_PART_DEEP_SCANLINE ||
+            edit->part_type == EXR_PART_DEEP_TILED)
+            any_deep = 1;
+        if (edit->tiled)
+            rc = rewrite_tiled_count(edit, vw, vh, &want);
+        else
+            rc = rewrite_scanline_count(edit, vh, &want);
+        if (rc != EXR_SUCCESS) goto fail;
+        if (want != ip->num_chunks) { rc = EXR_ERROR_LAYOUT_CHANGED; goto fail; }
+        chunk_counts[p] = want;
+        /* Channel order is the name-sorted order used by the serializer. */
+        order = (int *)exr_malloc(a, (size_t)(edit->num_channels
+                                                   ? edit->num_channels
+                                                   : 1) *
+                                          sizeof(int));
+        if (!order) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+        rc = sort_channels(a, edit, order);
+        if (rc != EXR_SUCCESS) { exr_free(a, order); goto fail; }
+        orders[p] = order;
+        new_offsets[p] = (uint64_t *)exr_calloc(a, want ? want : 1,
+                                                sizeof(uint64_t));
+        if (!new_offsets[p]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+        {
+            size_t table_bytes;
+            if (exr_mul_ovf((size_t)want, 8u, &table_bytes)) {
+                rc = EXR_ERROR_CORRUPT; goto fail;
+            }
+            if (metadata_total > UINT64_MAX - table_bytes) {
+                rc = EXR_ERROR_LIMIT_EXCEEDED; goto fail;
+            }
+            metadata_total += table_bytes;
+        }
+    }
+    /* The version word must describe the same container as the source; an
+     * edit that flips a flag (tiled/deep/multipart/long-names) is a layout
+     * change rather than a header tweak. */
+    {
+        uint32_t recomputed = EXR_VERSION_NUMBER;
+        if (any_long) recomputed |= EXR_VERSION_FLAG_LONG_NAMES;
+        if (r->is_multipart) recomputed |= EXR_VERSION_FLAG_MULTIPART;
+        else if (any_tiled && !any_deep) recomputed |= EXR_VERSION_FLAG_TILED;
+        if (any_deep) recomputed |= EXR_VERSION_FLAG_NON_IMAGE;
+        if (recomputed != r->version_flags) {
+            rc = EXR_ERROR_LAYOUT_CHANGED;
+            goto fail;
+        }
+        if (exr_context_max_header_bytes(r->context) &&
+            metadata_total > exr_context_max_header_bytes(r->context)) {
+            rc = EXR_ERROR_LIMIT_EXCEEDED;
+            goto fail;
+        }
+    }
+
+    /* From here on the sink is in use and must be closed exactly once. */
+    sink_taken = 1;
+
+    /* ---- magic + version word -------------------------------------------- */
+    {
+        uint8_t t[8];
+        exr_wr_u32(t, EXR_MAGIC);
+        exr_wr_u32(t + 4, r->version_flags);
+        rc = rewrite_sink_write(sink, t, 8, &out_pos);
+        if (rc != EXR_SUCCESS) goto fail;
+    }
+
+    /* ---- headers ---------------------------------------------------------- */
+    for (p = 0; p < r->num_parts; ++p) {
+        const exr_int_part *ip = &r->parts[p];
+        const exr_header *edit = headers ? headers[p] : &ip->header;
+        int32_t max_samples = 0;
+        const exr_attr *ms;
+        obuf hp;
+        memset(&hp, 0, sizeof(hp));
+        hp.a = a;
+        hp.limit = exr_context_max_file_bytes(r->context);
+        ms = exr_attr_find(edit->attrs, "maxSamplesPerPixel");
+        if (ms && ms->size == 4) max_samples = exr_rd_i32(ms->data);
+        write_header(&hp, edit, orders[p],
+                     edit->compression, r->is_multipart, chunk_counts[p],
+                     max_samples, edit->name[0] ? edit->name : "");
+        if (hp.err) { rc = hp.err; exr_free(a, hp.data); goto fail; }
+        rc = rewrite_sink_write(sink, hp.data, hp.len, &out_pos);
+        exr_free(a, hp.data);
+        if (rc != EXR_SUCCESS) goto fail;
+    }
+    if (r->is_multipart) {
+        uint8_t z = 0;
+        rc = rewrite_sink_write(sink, &z, 1, &out_pos);
+        if (rc != EXR_SUCCESS) goto fail;
+    }
+
+    /* ---- zeroed offset tables (backpatched later) ------------------------- */
+    {
+        uint64_t lim = exr_context_max_header_bytes(r->context);
+        if (lim && out_pos > lim) { rc = EXR_ERROR_LIMIT_EXCEEDED; goto fail; }
+    }
+    for (p = 0; p < r->num_parts; ++p) {
+        size_t need = (size_t)chunk_counts[p] * 8u;
+        uint8_t *zeros;
+        off_pos[p] = out_pos;
+        if (need) {
+            zeros = (uint8_t *)exr_calloc(a, need, 1);
+            if (!zeros) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+            rc = rewrite_sink_write(sink, zeros, need, &out_pos);
+            exr_free(a, zeros);
+            if (rc != EXR_SUCCESS) goto fail;
+        }
+    }
+
+    /* ---- chunk passthrough ------------------------------------------------- */
+    copy_buf = (uint8_t *)exr_malloc(a, REWRITE_COPY_BUFFER);
+    if (!copy_buf) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+    for (p = 0; p < r->num_parts; ++p) {
+        const exr_int_part *ip = &r->parts[p];
+        uint32_t k;
+        for (k = 0; k < ip->num_chunks; ++k) {
+            uint64_t src_off = ip->offsets[k];
+            size_t remaining, this_len;
+            rc = rewrite_measure_chunk(r, p, k, &remaining);
+            if (rc != EXR_SUCCESS) goto fail;
+            new_offsets[p][k] = out_pos;
+            while (remaining > 0) {
+                const uint8_t *ptr;
+                this_len = remaining > REWRITE_COPY_BUFFER
+                               ? REWRITE_COPY_BUFFER
+                               : remaining;
+                rc = rewrite_fetch(r, src_off, this_len, &ptr);
+                if (rc != EXR_SUCCESS) goto fail;
+                rc = rewrite_sink_write(sink, ptr, this_len, &out_pos);
+                if (rc != EXR_SUCCESS) goto fail;
+                src_off += this_len;
+                remaining -= this_len;
+            }
+        }
+    }
+
+    /* ---- backpatch offset tables (fixed-size chunks; O(1) working set) --- */
+    {
+        uint8_t *bp;
+        const size_t cap_entries = REWRITE_COPY_BUFFER / sizeof(uint64_t);
+        bp = (uint8_t *)exr_malloc(a, cap_entries * sizeof(uint64_t));
+        if (!bp) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+        for (p = 0; p < r->num_parts; ++p) {
+            uint32_t k = 0;
+            rc = sink->seek(sink->user, off_pos[p]);
+            if (rc != EXR_SUCCESS) break;
+            while (k < chunk_counts[p]) {
+                size_t batch = (size_t)chunk_counts[p] - (size_t)k;
+                size_t j;
+                if (batch > cap_entries) batch = cap_entries;
+                for (j = 0; j < batch; ++j)
+                    exr_wr_u64(bp + j * 8, new_offsets[p][k + (uint32_t)j]);
+                rc = sink->write(sink->user, bp, batch * 8u);
+                if (rc != EXR_SUCCESS) break;
+                k += (uint32_t)batch;
+            }
+            if (rc != EXR_SUCCESS) {
+                if (rc == EXR_WOULD_BLOCK) rc = EXR_ERROR_IO;
+                break;
+            }
+        }
+        exr_free(a, bp);
+        if (rc != EXR_SUCCESS) goto fail;
+        rc = sink->seek(sink->user, out_pos);
+        if (rc != EXR_SUCCESS) goto fail;
+    }
+
+fail:
+    if (new_offsets)
+        for (p = 0; p < r->num_parts; ++p) exr_free(a, new_offsets[p]);
+    exr_free(a, new_offsets);
+    exr_free(a, chunk_counts);
+    exr_free(a, off_pos);
+    if (orders)
+        for (p = 0; p < r->num_parts; ++p)
+            exr_free(a, orders[p]);
+    exr_free(a, orders);
+    exr_free(a, copy_buf);
+    if (sink_taken && sink->close) {
+        exr_result close_rc = sink->close(sink->user);
+        if (rc == EXR_SUCCESS && close_rc != EXR_SUCCESS)
+            rc = close_rc == EXR_WOULD_BLOCK ? EXR_ERROR_IO : close_rc;
+    }
+    return rc;
+}

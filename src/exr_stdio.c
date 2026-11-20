@@ -207,3 +207,19 @@ exr_result exr_writer_begin_stream_file(exr_writer *w, const char *path,
     if (!EXR_OK(rc)) fclose(fp); /* ownership not transferred on failure */
     return rc;
 }
+
+/* ---- header-only rewrite to a seekable file ----------------------------- */
+
+exr_result exr_rewrite_to_file(exr_reader *r, const exr_header *const *headers,
+                               const char *path) {
+    exr_data_sink sink;
+    FILE *fp;
+    if (!path) return EXR_ERROR_INVALID_ARGUMENT;
+    fp = fopen(path, "wb+");
+    if (!fp) return EXR_ERROR_IO;
+    sink.user = fp;
+    sink.write = file_sink_write;
+    sink.seek = file_sink_seek;
+    sink.close = file_sink_close; /* the rewrite core closes it exactly once */
+    return exr_rewrite_to_sink(r, headers, &sink);
+}

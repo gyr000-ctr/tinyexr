@@ -46,6 +46,10 @@ typedef enum exr_result {
     EXR_ERROR_IO = -5,              /* file open/read/write failure */
     EXR_ERROR_CORRUPT = -6,         /* bounds/overflow/decode failure */
     EXR_ERROR_LIMIT_EXCEEDED = -7,  /* configured resource limit exceeded */
+    EXR_ERROR_NOT_SEEKABLE = -8,    /* rewrite sink lacks seek(); offset-table
+                                     * backpatch needs a seekable destination */
+    EXR_ERROR_LAYOUT_CHANGED = -9,  /* header-only rewrite would change the chunk
+                                     * geometry/count (needs full re-encode) */
 } exr_result;
 
 #define EXR_OK(r) ((int)(r) >= 0)
@@ -615,6 +619,47 @@ exr_result exr_writer_write_deep_tile(exr_writer *w, int32_t part,
 /* Backpatch every offset table (seek + write) and flush. For the file-backed
  * sink this also closes the file. */
 exr_result exr_writer_end_stream(exr_writer *w);
+
+/* ============================================================================
+ * Header-only rewrite (metadata edit without touching pixel data)
+ *
+ * Re-serializes the headers of an already-parsed file and copies every chunk
+ * (compressed scanline block / tile / deep chunk) byte-for-byte, rebuilding the
+ * offset tables for the new byte positions. No codec runs: compressed payloads
+ * are never decoded or re-encoded, so unchanged parts stay bit-identical at the
+ * chunk level. Working memory is O(1) in the file size: one fixed copy buffer
+ * plus the reader's metadata (offset tables are already retained there).
+ *
+ * Only layout-preserving edits are possible. The part count and, per part, the
+ * channel list (chlist), compression, dataWindow, part type, tile descriptor
+ * (tiles) and line order must be unchanged, because each of them changes the
+ * number, ordering or on-disk layout of chunks. Display window, names,
+ * chromaticities, screen-window values and arbitrary custom/standard
+ * non-structural attributes may be edited freely. A structural change is
+ * reported with EXR_ERROR_LAYOUT_CHANGED (use the full writer for that).
+ *
+ * The destination must be seekable so the offset tables can be backpatched; a
+ * sink whose seek is NULL returns EXR_ERROR_NOT_SEEKABLE before any byte is
+ * written. The reader's data source must be the normal random-access source
+ * (memory or exr_data_source); it provides the chunk bytes on demand. After
+ * preflight succeeds the sink is considered owned by the call: its close
+ * callback (if any) is invoked exactly once when the rewrite finishes, whether
+ * it succeeds or fails; on failure the sink content is partial.
+ * ========================================================================== */
+
+/* Rewrite `r` (already opened and with exr_reader_parse_header() done) to
+ * `sink`. `headers` has num_parts entries and supplies the edited headers;
+ * pass NULL to re-serialize the reader's own parsed headers unchanged (a pure
+ * byte-layout normalization, still producing valid offset tables). The
+ * headers array and its contents are borrowed for the call and stay owned by
+ * the caller. The sink is seekable-required; see the section above. */
+exr_result exr_rewrite_to_sink(exr_reader *r, const exr_header *const *headers,
+                               const exr_data_sink *sink);
+
+/* Convenience: header-only rewrite straight to a seekable file path (stdio;
+ * defined in the optional exr_stdio.c module). */
+exr_result exr_rewrite_to_file(exr_reader *r, const exr_header *const *headers,
+                               const char *path);
 
 /* ============================================================================
  * Spectral images (JCGT 2021 "An OpenEXR Layout for Spectral Images";

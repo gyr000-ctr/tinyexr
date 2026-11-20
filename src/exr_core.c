@@ -26,6 +26,9 @@ const char *exr_result_string(exr_result r) {
     case EXR_ERROR_IO: return "I/O error";
     case EXR_ERROR_CORRUPT: return "corrupt or malformed data";
     case EXR_ERROR_LIMIT_EXCEEDED: return "configured resource limit exceeded";
+    case EXR_ERROR_NOT_SEEKABLE: return "destination is not seekable";
+    case EXR_ERROR_LAYOUT_CHANGED:
+        return "header edit changes chunk layout; full re-encode required";
     }
     return "unknown error";
 }
